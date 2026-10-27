@@ -1655,9 +1655,10 @@ First state the likely USD effect and confidence. Then map it to the instrument'
 ANALYSIS ORDER:
 - Data quality: identify source, observation/release period, missing fields, and whether the release is pending or published.
 - Release comparison: state actual, forecast, previous, actual-vs-forecast surprise, and actual/forecast-vs-previous change only when supplied and comparable.
-- Macro transmission: explain how this event and surprise direction may alter Fed/rate expectations, yields, and USD; distinguish a general tendency from a certain outcome.
-- Instrument response: map USD strength/weakness to this exact symbol, then weigh its own drivers and supplied market structure, DXY, timeframe, and microstructure.
-- Decision: give BUY, SELL, or WAIT. Choose WAIT when actual/forecast data are missing or conflicting, the transmission is ambiguous, or the evidence does not support a clear edge. Never force a direction. Do not provide entry, stop-loss, or take-profit prices.
+- Macro transmission: explain how this event and the supplied data may alter Fed/rate expectations, yields, and USD; distinguish a likely tendency from a certain outcome. For unreleased events, assess the most likely direction from available expectations and context, but explicitly say when the release outcome itself is unknown.
+- Instrument response: map the likely USD effect to this exact symbol, then weigh its own drivers and supplied market structure, DXY, timeframe, and microstructure. For XAUUSD, stronger USD normally pressures gold and weaker USD normally supports it; explain any stronger safe-haven or technical evidence that changes that base case.
+- Decision: for a successful AI analysis, ALWAYS select exactly one actionable direction: BUY or SELL. Do not return WAIT, HOLD, neutral, or no-trade. Missing actual data is not by itself a reason to abstain: make the best-supported directional call using the event's typical macro transmission and the live market evidence. If the event-specific direction is unknowable or evidence conflicts, use the strongest current instrument-specific structure and DXY evidence as the tie-breaker, lower confidence, and state the uncertainty plainly. Do not claim an unreleased outcome is known. Do not provide entry, stop-loss, or take-profit prices.
+- Reasoning: provide at least 150 words that directly justify the selected BUY/SELL signal. Cover the event data and whether the actual is pending, the likely USD channel, the mapping into this instrument, the strongest confirming and opposing live evidence, and why the chosen direction wins despite uncertainty. Never describe a WAIT decision when the signal is BUY or SELL.
 
 DATA PROVIDED:
 {data_summary}
@@ -1688,7 +1689,7 @@ Return strict JSON only, no markdown. Keep reasoning concise but explicit; cite 
 {{
 "market_state": "continuation|reversal|exhaustion|trend|coiling|unclear",
 "bias": "BULLISH|BEARISH|RANGING",
-"signal": "BUY|SELL|WAIT",
+"signal": "BUY|SELL",
 "confluence_score": 0,
 "confidence": "HIGH|MEDIUM|LOW",
 "usd_impact": "STRONGER|WEAKER|MIXED|UNKNOWN",
@@ -1702,7 +1703,7 @@ Return strict JSON only, no markdown. Keep reasoning concise but explicit; cite 
 "current_positioning": "Supplied current market positioning relative to the conditional/observed move",
 "news_impact_mechanics": "Event-to-rates-to-USD-to-this-instrument transmission and caveats",
 "reasoning": "Evidence-based synthesis",
-"rejection_reason": "Why WAIT was selected; otherwise empty"
+"rejection_reason": "Empty; the directional signal must be BUY or SELL"
 }}"""
 
 # ── Groq API Integration (Robust Pattern) ────────────────────────────────
