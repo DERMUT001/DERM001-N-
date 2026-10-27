@@ -1,6 +1,7 @@
 import os, json, requests, time, re, random, traceback, uuid, html
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import StringIO
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 import streamlit as st
@@ -142,7 +143,7 @@ def build_news_event_telegram(event, results, now):
         "📰 <b>DER-AI NEWS IMPACT SIGNAL</b>",
         f"📌 Event: {_escape_telegram_html(event.get('event'))}",
         f"🕒 Event time: {_escape_telegram_html(event_time_str)}",
-        f"⏳ Sent {_escape_telegram_html(lead)} before the release (once per event)",
+        ("📊 Post-release actual analysis" if event.get('analysis_phase') == 'POST_RELEASE' else f"⏳ Sent {_escape_telegram_html(lead)} before the release (once per event)"),
         "",
     ]
     for symbol, a in results.items():
@@ -188,6 +189,11 @@ def _coerce_impact(impact: Any) -> str:
     if text in {"2", "medium", "orange", "moderate"}:
         return "MEDIUM"
     return text.upper() if text else "UNKNOWN"
+
+def has_reported_value(value):
+    if value is None:
+        return False
+    return str(value).strip().lower() not in {"", "-", "--", "—", "–", "n/a", "na", "none", "null", "pending"}
 
 def normalize_event_time(date_str, time_str, timezone_name, reference_dt=None):
     if not date_str:
@@ -265,6 +271,10 @@ def parse_news_payload(payload, reference_dt=None, lookahead_hours=72, only_high
         events.append({
             "event": str(item.get("event") or item.get("title") or "Economic Event").strip(),
             "currency": str(item.get("country") or item.get("currency") or item.get("pair") or "USD").strip(),
+            "actual": item.get("actual"),
+            "forecast": item.get("forecast"),
+            "previous": item.get("previous"),
+            "unit": item.get("unit"),
             "impact": "HIGH" if impact == "HIGH" else "MEDIUM",
             "time": event_dt.strftime("%Y-%m-%d %H:%M UTC"),
             "event_time_utc": event_dt,
@@ -1392,7 +1402,7 @@ FRED_SERIES_MAP = {
     "CORE CPI": "CPILFESL",
     "CPI": "CPIAUCSL",
     "CORE PCE": "PCEPILFE",
-    "PCE": "PCEPILFE",
+    "PCE": "PCEPI",
     "GDP": "GDP",
     "FOMC": "FEDFUNDS",
     "FED FUNDS": "FEDFUNDS",
@@ -1402,8 +1412,6 @@ FRED_SERIES_MAP = {
     "INITIAL CLAIMS": "ICSA",
     "MICHIGAN": "UMCSENT",
     "CONSUMER SENTIMENT": "UMCSENT",
-    "ISM": "INDPRO",
-    "PMI": "INDPRO",
     "INDUSTRIAL PRODUCTION": "INDPRO",
     "TREASURY": "DGS10",
 }
@@ -1419,34 +1427,89 @@ def _match_fred_series(event_name):
     return None
 
 def fetch_fred_observations(series_id, limit=5):
+    api_key = get_secret("FRED_API_KEY", "")
+    if api_key:
+        try:
+            res = requests.get(
+                "https://api.stlouisfed.org/fred/series/observations",
+                params={
+                    "series_id": series_id,
+                    "api_key": api_key,
+                    "file_type": "json",
+                    "sort_order": "desc",
+                    "limit": limit,
+                },
+                timeout=15,
+            )
+            res.raise_for_status()
+            observations = res.json().get("observations", [])
+            out = []
+            for observation in observations:
+                try:
+                    out.append({
+                        "date": observation.get("date"),
+                        "value": float(observation.get("value")),
+                        "source": "FRED API",
+                    })
+                except (TypeError, ValueError):
+                    continue
+            if out:
+                return out
+        except Exception as exc:
+            print(f"FRED API fetch failed for {series_id}: {exc}")
+
     try:
-        api_key = get_secret("FRED_API_KEY", "")
-        if not api_key:
-            return None
-        url = "https://api.stlouisfed.org/fred/series/observations"
-        params = {
-            "series_id": series_id,
-            "api_key": api_key,
-            "file_type": "json",
-            "sort_order": "desc",
-            "limit": limit,
-        }
-        res = requests.get(url, params=params, timeout=15)
+        start_date = (datetime.now(timezone.utc) - timedelta(days=365 * 3)).date().isoformat()
+        res = requests.get(
+            "https://fred.stlouisfed.org/graph/fredgraph.csv",
+            params={"id": series_id, "cosd": start_date},
+            timeout=20,
+        )
         res.raise_for_status()
-        data = res.json()
-        obs = data.get("observations", [])
-        obs = [o for o in obs if o.get("value") not in (".", None, "")]
-        if not obs:
+        frame = pd.read_csv(StringIO(res.text))
+        date_column = "observation_date" if "observation_date" in frame.columns else frame.columns[0]
+        if series_id not in frame.columns:
             return None
-        out = []
-        for o in obs:
-            try:
-                out.append({"date": o.get("date"), "value": float(o.get("value"))})
-            except Exception:
-                continue
-        return out or None
-    except Exception:
+        frame[series_id] = pd.to_numeric(frame[series_id], errors="coerce")
+        frame = frame.dropna(subset=[series_id]).sort_values(date_column, ascending=False).head(limit)
+        observations = [
+            {"date": str(row[date_column]), "value": float(row[series_id]), "source": "FRED public CSV"}
+            for _, row in frame.iterrows()
+        ]
+        return observations or None
+    except Exception as exc:
+        print(f"FRED CSV fetch failed for {series_id}: {exc}")
         return None
+
+def build_event_release_context(event):
+    fields = {key: event.get(key) for key in ("actual", "forecast", "previous")}
+    lines = ["Calendar release values (as supplied; blank means unavailable):"]
+    lines.extend(f"{key.title()}: {value if has_reported_value(value) else 'unavailable'}" for key, value in fields.items())
+
+    def numeric_value(value):
+        if not has_reported_value(value):
+            return None
+        match = re.search(r"[-+]?\d[\d,]*(?:\.\d+)?", str(value))
+        if not match:
+            return None
+        try:
+            return float(match.group().replace(",", "")), str(value)[match.end():].strip().upper()
+        except ValueError:
+            return None
+
+    def compare(label, left_key, right_key):
+        left = numeric_value(fields[left_key])
+        right = numeric_value(fields[right_key])
+        if not left or not right or left[1] != right[1]:
+            return
+        difference = left[0] - right[0]
+        direction = "increased" if difference > 0 else "decreased" if difference < 0 else "was unchanged"
+        lines.append(f"{label}: {direction} by {difference:+g}{left[1]} versus {fields[right_key]}.")
+
+    compare("Forecast versus previous release", "forecast", "previous")
+    compare("Actual versus previous release", "actual", "previous")
+    compare("Actual versus consensus forecast", "actual", "forecast")
+    return " ".join(lines)
 
 def fetch_fred_historical_context(event, ttl_seconds=3600):
     try:
@@ -1459,14 +1522,39 @@ def fetch_fred_historical_context(event, ttl_seconds=3600):
         cached = st.session_state.get(cache_key)
         if cached and (now - cached.get("fetched_at", now)).total_seconds() < ttl_seconds:
             return cached.get("text")
-        observations = fetch_fred_observations(series_id, limit=5)
+        observations = fetch_fred_observations(series_id, limit=6)
         if not observations:
             return None
-        parts = []
-        for o in observations:
-            parts.append("{} = {}".format(o["date"], o["value"]))
-        text = "FRED {} last {} releases (most recent first): {}".format(
-            series_id, len(observations), "; ".join(parts))
+        parts = ["{} = {:g}".format(o["date"], o["value"]) for o in observations]
+        current = observations[0]
+        previous = observations[1] if len(observations) > 1 else None
+        comparison = "previous observation unavailable"
+        if previous:
+            change = current["value"] - previous["value"]
+            percent_change = (change / abs(previous["value"])) * 100 if previous["value"] else None
+            unit = {
+                "PAYEMS": "thousand jobs",
+                "UNRATE": "percentage points",
+                "CPIAUCSL": "index points",
+                "CPILFESL": "index points",
+                "PCEPI": "index points",
+                "PCEPILFE": "index points",
+                "GDP": "USD billions (SAAR)",
+                "FEDFUNDS": "percentage points",
+                "ICSA": "claims",
+                "RSAFS": "USD millions",
+                "NAPM": "index points",
+                "INDPRO": "index points",
+                "DGS10": "percentage points",
+            }.get(series_id, "series units")
+            comparison = "change vs prior observation: {:+g} {}".format(change, unit)
+            if percent_change is not None:
+                comparison += " ({:+.2f}%)".format(percent_change)
+            comparison += " from {} to {}".format(previous["date"], current["date"])
+        text = (
+            "FRED source: {}; series {}; latest reported observation for period {} = {:g}; {}; "
+            "recent periods, newest first: {}. These are reported indicator periods, not necessarily this calendar month's release."
+        ).format(current.get("source", "FRED"), series_id, current["date"], current["value"], comparison, "; ".join(parts))
         st.session_state[cache_key] = {"text": text, "fetched_at": now}
         return text
     except Exception:
@@ -1481,12 +1569,10 @@ def fetch_news_historical_context(event):
                 curated = "Typical USD impact: {} | Historical pattern: {}".format(usd_impact, history)
                 break
         fred_data = fetch_fred_historical_context(event)
-        if fred_data and curated:
-            return fred_data + " || " + curated
-        if fred_data:
-            return fred_data
-        if curated:
-            return curated
+        release_data = build_event_release_context(event)
+        parts = [part for part in (release_data, fred_data, curated) if part]
+        if parts:
+            return " || ".join(parts)
     except Exception:
         pass
     return None
@@ -1526,8 +1612,8 @@ def get_high_impact_news(selected_symbols=None, reference_dt=None):
                 continue
             events = parse_news_payload(payload, reference_dt=reference_dt, lookahead_hours=168, only_high=False)
             if events:
-                filtered_events = filter_relevant_news([{'event': e['event'], 'currency': e['currency'], 'impact': e['impact'], 'time': e['time'], 'event_time_utc': e['event_time_utc'], 'minutes_until': e['minutes_until'], 'within_2h': e['within_2h'], 'timezone': e['timezone']} for e in events], selected_symbols=selected_symbols, reference_dt=reference_dt)
-                final = [{'time': format_east_africa_time(e['event_time_utc']), 'currency': e['currency'], 'event': e['event'], 'impact': e['impact'], 'minutes_until': e['minutes_until'], 'within_2h': e['within_2h'], 'timezone': e['timezone'], 'event_time_utc': e['event_time_utc'], 'event_id': f"{e['event']}|{e['currency']}|{e['event_time_utc'].strftime('%Y-%m-%d %H:%M:%S')}"} for e in filtered_events]
+                filtered_events = filter_relevant_news([{'event': e['event'], 'currency': e['currency'], 'actual': e['actual'], 'forecast': e['forecast'], 'previous': e['previous'], 'unit': e['unit'], 'impact': e['impact'], 'time': e['time'], 'event_time_utc': e['event_time_utc'], 'minutes_until': e['minutes_until'], 'within_2h': e['within_2h'], 'timezone': e['timezone']} for e in events], selected_symbols=selected_symbols, reference_dt=reference_dt)
+                final = [{'time': format_east_africa_time(e['event_time_utc']), 'currency': e['currency'], 'event': e['event'], 'actual': e['actual'], 'forecast': e['forecast'], 'previous': e['previous'], 'unit': e['unit'], 'impact': e['impact'], 'minutes_until': e['minutes_until'], 'within_2h': e['within_2h'], 'timezone': e['timezone'], 'event_time_utc': e['event_time_utc'], 'event_id': f"{e['event']}|{e['currency']}|{e['event_time_utc'].strftime('%Y-%m-%d %H:%M:%S')}"} for e in filtered_events]
                 if final:
                     break
         except Exception as exc:
@@ -1555,38 +1641,24 @@ def update_news_event_status(event, status, detail=None):
 
 # ── Rich News Analysis Prompt ────────────────────────────────────────────
 def build_news_analysis_prompt():
-    return """You are an elite news-driven macro analyst operating with the discipline of a professional trading desk. You analyze high-impact USD-sensitive news BEFORE it is released using a SYSTEMATIC MULTI-LAYER ANALYSIS to project how the event will affect trading pairs AT THE TIME of the news reading.
-═══════════════════════════════════════════════════════════════════════════════
-SYSTEMATIC ANALYSIS FRAMEWORK (FOLLOW IN ORDER):
-═══════════════════════════════════════════════════════════════════════════════
-LAYER 1 - HISTORICAL RELEASE PATTERN ANALYSIS:
-- Recall the LAST 3-4 RELEASES of this specific event type
-- For each release: What was the previous value? What was the consensus? What was the actual? What was the surprise?
-- How did the market react to each surprise? (direction, magnitude, duration)
-- What is the typical consensus expectation for THIS release?
-- What would constitute a surprise vs consensus for THIS release?
-LAYER 2 - CURRENT MARKET POSITIONING ANALYSIS:
-- Analyze the CURRENT MARKET STRUCTURE provided (structure context, HTF context)
-- Where is price positioned relative to key levels? (premium/discount, key support/resistance)
-- What is the current momentum and trend across timeframes?
-- What is the current RSI positioning across timeframes?
-- What is the current DXY trend and positioning?
-- Based on current positioning, is the market positioned FOR or AGAINST the expected news outcome?
-LAYER 3 - NEWS IMPACT MECHANICS:
-- How does THIS specific event type typically affect the US Dollar?
-- How does THIS specific event type typically affect EACH SYMBOL (XAUUSD, EURUSD, BTCUSD, US30)?
-- What is the typical reaction pattern? (immediate spike, delayed reaction, fade, continuation)
-- What time of day is the release? (affects liquidity and reaction magnitude)
-- What is the current market session? (affects liquidity and reaction magnitude)
-LAYER 4 - CROSS-ASSET CORRELATION ANALYSIS:
-- How do different symbols typically react to THIS event type?
-- Are there any cross-asset correlations that confirm or contradict the expected move?
-- Are there any divergences between assets that suggest a specific outcome?
-LAYER 5 - SYNTHESIS AND DIRECTIONAL EDGE:
-- Combine all layers to determine the EXPECTED NEWS OUTCOME (stronger/weaker USD)
-- Determine the EXPECTED SYMBOL REACTION for each symbol
-- Determine if current positioning is FOR or AGAINST the expected outcome
-- Determine the directional edge: Should the trader be positioned LONG or SHORT when the news drops?
+    return """You are a careful macro and cross-asset analyst. Assess the supplied economic event and the specific instrument under analysis using only the supplied facts and clearly identified general economic relationships. Do not invent releases, consensus, values, dates, historical reactions, market positioning, or correlations.
+
+RELEASE-DATA METHOD:
+1. Separate calendar Actual, Forecast (consensus), and Previous. Forecast versus Previous is an expected change, NOT a surprise. Only compare Actual with Forecast to assess a surprise, and compare Actual with Previous to assess the change from the last release. Use the supplied comparison calculations when present.
+2. An empty/unavailable Actual is not zero and is not a released value. For a future event, say the actual is pending and assess scenarios: above/below consensus. Do not state a definite surprise direction before the release.
+3. FRED observations are the latest reported indicator periods. Their period dates may lag this calendar month. Compare the latest period with the prior period and describe the measured change, but never call it this month's event actual unless the dates and release context prove that they are the same release. FRED does not provide consensus; do not infer one.
+4. Interpret whether a higher or lower value supports USD based on the indicator (for example, stronger payroll growth or hotter inflation can support USD; higher unemployment or claims can weigh on USD). A numeric increase alone does not determine USD direction. Consider revisions, the forecast, the prior value, and mixed components where supplied.
+
+PAIR-DIRECTION METHOD:
+First state the likely USD effect and confidence. Then map it to the instrument's quote convention: for a pair BASE/QUOTE, stronger USD raises the pair when USD is BASE and usually lowers it when USD is QUOTE; weaker USD usually reverses that. XAUUSD and EURUSD have USD as QUOTE. For BTCUSD and US30, USD/yield effects can be outweighed by risk appetite, liquidity, or growth expectations, so do not claim a mechanical inverse correlation. If the instrument or currency exposure is unclear, say so. Use current DXY and price structure as confirmation or contradiction, not as proof of the event outcome.
+
+ANALYSIS ORDER:
+- Data quality: identify source, observation/release period, missing fields, and whether the release is pending or published.
+- Release comparison: state actual, forecast, previous, actual-vs-forecast surprise, and actual/forecast-vs-previous change only when supplied and comparable.
+- Macro transmission: explain how this event and surprise direction may alter Fed/rate expectations, yields, and USD; distinguish a general tendency from a certain outcome.
+- Instrument response: map USD strength/weakness to this exact symbol, then weigh its own drivers and supplied market structure, DXY, timeframe, and microstructure.
+- Decision: give BUY, SELL, or WAIT. Choose WAIT when actual/forecast data are missing or conflicting, the transmission is ambiguous, or the evidence does not support a clear edge. Never force a direction. Do not provide entry, stop-loss, or take-profit prices.
+
 DATA PROVIDED:
 {data_summary}
 MICROSTRUCTURE (M10):
@@ -1603,7 +1675,7 @@ HTF CONTEXT (H1/H4):
 {htf_context}
 DXY (US Dollar Index) TREND:
 {dxy_data}
-HISTORICAL CONTEXT:
+RELEASE AND HISTORICAL DATA:
 {historical_context}
 NEWS EVENT DETAILS:
 {news_summary}
@@ -1611,39 +1683,26 @@ STRUCTURAL SCORE (PYTHON):
 {structural_score_context}
 PYTHON DIRECTIONAL LEDGER (REFERENCE EVIDENCE):
 {directional_ledger}
-═══════════════════════════════════════════════════════════════════════════════
-MANDATORY ANALYSIS RULES:
-═══════════════════════════════════════════════════════════════════════════════
-1. COMPLETE ALL 5 LAYERS OF ANALYSIS before determining the final signal
-2. For EACH SYMBOL, determine:
-- Expected USD impact (stronger/weaker/neutral)
-- Expected symbol reaction (up/down/neutral)
-- Current positioning (for/against the expected move)
-- Final directional edge (long/short/neutral)
-3. Be SPECIFIC about historical patterns - cite specific previous releases and reactions
-4. ALWAYS USE THE PROVIDED HISTORICAL CONTEXT: explicitly cite the last 3-4 releases (previous, consensus, actual, surprise) from the `HISTORICAL CONTEXT` field included in the DATA PROVIDED. If precise release numbers are not available in the field, state that explicitly and infer the pattern from the summary.
-5. Be SPECIFIC about current positioning - cite specific levels and indicators
-6. Be SPECIFIC about the expected reaction - cite the mechanism and timing
-7. Output BUY or SELL when there is a clear directional edge
-8. NEVER output WAIT for a news signal. Always pick BUY or SELL with detailed reasoning.
-9. DO NOT output Entry, SL, or TP levels - focus ONLY on direction and reasoning
-10. Write DETAILED reasoning (minimum 200 words) that shows your complete analysis process
-OUTPUT STRICT JSON ONLY (NO MARKDOWN, NO CODE FENCES):
+
+Return strict JSON only, no markdown. Keep reasoning concise but explicit; cite exact values/periods when available and label unavailable information. Schema:
 {{
-"market_state": "continuation|reversal|exhaustion|trend|coiling",
+"market_state": "continuation|reversal|exhaustion|trend|coiling|unclear",
 "bias": "BULLISH|BEARISH|RANGING",
-"signal": "BUY|SELL",
+"signal": "BUY|SELL|WAIT",
 "confluence_score": 0,
 "confidence": "HIGH|MEDIUM|LOW",
-"dxy_correlation": "CONFIRMING|CONTRADICTING|NEUTRAL",
+"usd_impact": "STRONGER|WEAKER|MIXED|UNKNOWN",
+"instrument_effect": "UP|DOWN|MIXED|UNKNOWN",
+"dxy_correlation": "CONFIRMING|CONTRADICTING|NEUTRAL|UNAVAILABLE",
 "microstructure_read": "Brief summary of VWAP/RVOL status",
-"pre_news_bias": "Detailed explanation of expected USD impact and symbol reaction",
+"release_data_assessment": "Actual/forecast/previous values, period dates, comparisons, and data gaps",
+"pre_news_bias": "Conditional or observed USD impact and instrument reaction",
 "directional_evidence": {{"bullish": ["..."], "bearish": ["..."]}},
-"historical_pattern": "Detailed analysis of last 3-4 releases: previous values, consensus, actual, surprises, and market reactions",
-"current_positioning": "Detailed analysis of current market positioning relative to expected news outcome",
-"news_impact_mechanics": "Detailed explanation of how this event type affects USD and each symbol, including typical reaction patterns and timing",
-"reasoning": "Complete synthesis of all 5 layers showing your complete analysis process (minimum 200 words)",
-"rejection_reason": "If WAIT, detailed explanation of why there is no clear directional edge"
+"historical_pattern": "Only supplied release history and observed comparisons; explicitly state when unavailable",
+"current_positioning": "Supplied current market positioning relative to the conditional/observed move",
+"news_impact_mechanics": "Event-to-rates-to-USD-to-this-instrument transmission and caveats",
+"reasoning": "Evidence-based synthesis",
+"rejection_reason": "Why WAIT was selected; otherwise empty"
 }}"""
 
 # ── Groq API Integration (Robust Pattern) ────────────────────────────────
@@ -1903,10 +1962,10 @@ def analyze_news_for_symbol(symbol, all_data, event):
         if picture:
             firm, firm_notes = resolve_firm_direction(symbol, picture)
         
-        news_payload = [{'event_time_utc': event.get('event_time_utc', datetime.now(timezone.utc) + timedelta(minutes=max(0, event.get('minutes_until', 0)))), 'within_2h': event.get('within_2h', False), 'time': event.get('time', ''), 'currency': event.get('currency', ''), 'event': event.get('event', '')}]
+        news_payload = [{'event_time_utc': event.get('event_time_utc', datetime.now(timezone.utc) + timedelta(minutes=max(0, event.get('minutes_until', 0)))), 'within_2h': event.get('within_2h', False), 'time': event.get('time', ''), 'currency': event.get('currency', ''), 'event': event.get('event', ''), 'actual': event.get('actual'), 'forecast': event.get('forecast'), 'previous': event.get('previous')}]
         nc = build_news_context(news_payload, reference_dt=datetime.now(timezone.utc))
         news_text = format_news_summary(news_payload, limit=len(news_payload))
-        news_context = {'within_2h': nc.get('within_2h', False), 'bias': nc.get('bias', 'neutral'), 'upcoming_count': nc.get('upcoming_count', 0), 'next_event': nc.get('next_event'), 'pre_news_bias': nc.get('pre_news_bias', 'No imminent high-impact event.')}
+        news_context = {'within_2h': nc.get('within_2h', False), 'bias': nc.get('bias', 'neutral'), 'upcoming_count': nc.get('upcoming_count', 0), 'next_event': nc.get('next_event'), 'pre_news_bias': nc.get('pre_news_bias', 'No imminent high-impact event.'), 'analysis_phase': event.get('analysis_phase', 'PRE_RELEASE')}
         
         phase_context = detect_market_phase(m10, swings=swings)
         setup_context = build_setup_context(m10, swings, current_price, symbol, dxy_context=dxy_context, news_context=news_context)
@@ -1951,7 +2010,14 @@ def analyze_news_for_symbol(symbol, all_data, event):
         
         firm_bias_text = f"{firm} (standing desk bias; weighted MTF evidence {picture.get('score', 0):+.1f})" if firm else "NONE - evidence tied; stand aside unless a clear edge emerges."
         
-        news_summary = f"Event: {event['event']} | Currency: {event['currency']} | Time: {event['time']} | Impact: {event['impact']} | Minutes Until: {event['minutes_until']}"
+        news_summary = (
+            f"Instrument: {symbol} | Event: {event['event']} | Currency: {event['currency']} | "
+            f"Time: {event['time']} | Impact: {event['impact']} | Minutes Until: {event['minutes_until']} | "
+            f"Analysis phase: {event.get('analysis_phase', 'PRE_RELEASE')} | "
+            f"Calendar Actual: {event.get('actual') if has_reported_value(event.get('actual')) else 'unavailable'} | "
+            f"Calendar Forecast: {event.get('forecast') if has_reported_value(event.get('forecast')) else 'unavailable'} | "
+            f"Calendar Previous: {event.get('previous') if has_reported_value(event.get('previous')) else 'unavailable'} | Unit: {event.get('unit') or 'not supplied'}"
+        )
         
         all_format_kwargs = {
             'data_summary': prompt_data,
@@ -2023,56 +2089,30 @@ def analyze_news_for_symbol(symbol, all_data, event):
 
 def build_pre_news_fallback_analysis(symbol, m10, swings, pair_config, dxy_context, news_context, phase_context=None, live_price=None, htf_context=None, picture=None, firm=None, firm_notes=None, historical_context=None):
     micro = calculate_microstructure(m10) or {}
-    all_data_ref = st.session_state.get("cached_market_data", {}) or {}
     htf_dir = None
     if htf_context:
         htf_dir = htf_context.get('trend') or htf_context.get('bias')
-    
-    nxt = (news_context or {}).get("next_event") or {}
-    news_hist = fetch_news_historical_context(nxt) if isinstance(nxt, dict) else None
-    usd_thesis = None
-    if news_hist:
-        low = news_hist.lower()
-        if "weaker usd" in low:
-            usd_thesis = "WEAKER_USD"
-        elif "stronger usd" in low:
-            usd_thesis = "STRONGER_USD"
-    
-    direction = None
-    if usd_thesis == "STRONGER_USD":
-        direction = "SELL" if symbol in ("XAUUSD", "EURUSD", "BTCUSD") else "BUY"
-    elif usd_thesis == "WEAKER_USD":
-        direction = "BUY" if symbol in ("XAUUSD", "EURUSD", "BTCUSD") else "SELL"
-    else:
-        direction = htf_dir
-    
-    if direction not in ("BUY", "SELL"):
-        direction = htf_dir or ("BUY" if micro.get("momentum") == "BULLISH" else "SELL")
-    
-    confidence = "MEDIUM" if (htf_dir == direction or usd_thesis) else "LOW"
-    bias = "BULLISH" if direction == "BUY" else "BEARISH"
-    
-    reasoning = "Pre-news directional read for {} (fallback, AI unavailable). ".format(symbol)
-    reasoning += "Curated/FRED event impact: {}. ".format(news_hist or "no structured historical impact available")
-    reasoning += "HTF trend: {}. ".format(htf_dir or "neutral")
-    reasoning += "Direction set to {} from the USD thesis and higher-timeframe alignment. ".format(direction)
-    reasoning += "Direction-only guidance; execution levels withheld until live AI analysis."
+    phase = (news_context or {}).get("analysis_phase", "PRE_RELEASE")
+    reasoning = "{} analysis for {} (fallback, AI unavailable). ".format(phase.replace("_", " ").title(), symbol)
+    reasoning += "No verified event-to-USD-to-instrument assessment was produced. "
+    reasoning += "Higher-timeframe trend: {}. It is context only and is not sufficient to infer the news impact. ".format(htf_dir or "unavailable")
+    reasoning += "Wait for a successful AI analysis and verified release data; no directional trade is recommended."
     
     return {
-        "bias": bias,
-        "signal": normalize_ai_signal(direction),
-        "confluence_score": 72 if confidence == "MEDIUM" else 62,
-        "confidence": confidence,
-        "dxy_correlation": "CONFIRMING" if dxy_context else "NEUTRAL",
+        "bias": "RANGING",
+        "signal": "WAIT",
+        "confluence_score": 0,
+        "confidence": "LOW",
+        "dxy_correlation": "NEUTRAL" if dxy_context else "UNAVAILABLE",
         "microstructure_read": "VWAP {} | RVOL {}".format(micro.get("price_vs_vwap", "NEUTRAL"), micro.get("rvol", 0)),
         "pre_news_bias": (news_context or {}).get("pre_news_bias", "News-driven reaction expected"),
         "reasoning": reasoning,
-        "rejection_reason": None,
-        "structural_score": 70,
-        "score_reason": "Upgraded news fallback (USD thesis + HTF + FRED).",
-        "candidate_direction": direction,
+        "rejection_reason": "AI analysis unavailable; refusing to infer a news trade from generic event history or market trend alone.",
+        "structural_score": 0,
+        "score_reason": "No verified news-impact assessment available.",
+        "candidate_direction": "WAIT",
         "levels_source": "PYTHON",
-        "historical_pattern": news_hist or (historical_context or ""),
+        "historical_pattern": historical_context or "",
         "api_status": "FALLBACK",
         "model_used": PYTHON_FALLBACK_MODEL
     }
@@ -2080,12 +2120,15 @@ def build_pre_news_fallback_analysis(symbol, m10, swings, pair_config, dxy_conte
 def run_news_analysis_cycle(news_events, all_data, symbols):
     results_by_event = {}
     for event in news_events:
-        eid = event.get('event_id') or f"{event.get('event')}|{event.get('currency')}|{event.get('time')}"
+        base_event_id = event.get('event_id') or f"{event.get('event')}|{event.get('currency')}|{event.get('time')}"
+        has_actual = has_reported_value(event.get('actual'))
+        is_post_release = event.get('analysis_phase') == 'POST_RELEASE' and has_actual
+        eid = f"{base_event_id}|POST_RELEASE" if is_post_release else base_event_id
         if st.session_state.news_results.get(eid) or st.session_state.news_signal_sent.get(eid):
-            update_news_event_status(event, 'sent', 'Already analyzed; skipping repeat AI run to save tokens.')
+            update_news_event_status(event, 'sent', 'Published actual already analyzed; skipping repeat AI run.' if is_post_release else 'Already analyzed; skipping repeat AI run to save tokens.')
             continue
         
-        update_news_event_status(event, 'analyzing', 'AI pre-news impact analysis in progress...')
+        update_news_event_status(event, 'analyzing', 'AI post-release actual analysis in progress...' if is_post_release else 'AI pre-news impact analysis in progress...')
         results = {}
         for symbol in NEWS_ANALYSIS_SYMBOLS:
             if st.session_state.last_groq_request_time:
@@ -2103,6 +2146,7 @@ def run_news_analysis_cycle(news_events, all_data, symbols):
             if analysis.get('rejection_reason') == 'RATE_LIMIT':
                 results[symbol] = {'signal': 'SKIPPED', 'reason': 'Groq rate limit'}
                 continue
+            analysis['analysis_phase'] = 'POST_RELEASE' if is_post_release else 'PRE_RELEASE'
             results[symbol] = sanitize_news_event_analysis(analysis)
         
         st.session_state.news_results[eid] = {
@@ -2122,15 +2166,15 @@ def run_news_analysis_cycle(news_events, all_data, symbols):
             'analysis_completed': True,
             'completed_at': datetime.now()
         }
-        update_news_event_status(event, 'sent', 'Pre-news analysis completed; will not re-analyze.')
+        update_news_event_status(event, 'sent', 'Post-release actual analysis completed.' if is_post_release else 'Pre-news analysis completed; will not re-analyze.')
         
         message = build_news_event_telegram(event, results, datetime.now(timezone.utc))
         telegram_ok = send_telegram_message(message)
         if telegram_ok:
             st.session_state.news_signal_sent[eid]['summary_sent'] = True
-            update_news_event_status(event, 'sent', 'Pre-news impact signal sent to Telegram (once).')
+            update_news_event_status(event, 'sent', 'Post-release actual impact sent to Telegram.' if is_post_release else 'Pre-news impact signal sent to Telegram (once).')
         else:
-            update_news_event_status(event, 'sent', 'Pre-news analysis completed; Telegram delivery failed/not configured, but AI will not repeat.')
+            update_news_event_status(event, 'sent', 'Analysis completed; Telegram delivery failed/not configured, but AI will not repeat.')
         
         results_by_event[eid] = results
     
@@ -2191,13 +2235,26 @@ with tab2:
         for event_index, event in enumerate(st.session_state.fetched_news):
             event_id = event.get('event_id') or f"{event.get('event')}|{event.get('currency')}|{event.get('time')}"
             already_analyzed = bool(st.session_state.news_results.get(event_id) or st.session_state.news_signal_sent.get(event_id))
+            post_release_id = f"{event_id}|POST_RELEASE"
+            post_release_analyzed = bool(st.session_state.news_results.get(post_release_id) or st.session_state.news_signal_sent.get(post_release_id))
+            has_actual = has_reported_value(event.get('actual'))
             event_col, action_col = st.columns([4, 1])
             with event_col:
                 st.markdown(f"**📌 {event['event']}**  \n`{event['currency']}` | `{event['time']}` | `{event['impact']}`")
+                st.caption("Actual: {} | Forecast: {} | Previous: {}".format(
+                    event.get('actual') if has_actual else 'pending/unavailable',
+                    event.get('forecast') if has_reported_value(event.get('forecast')) else 'unavailable',
+                    event.get('previous') if has_reported_value(event.get('previous')) else 'unavailable',
+                ))
             with action_col:
-                button_label = "✅ Analysed" if already_analyzed else "🚀 Analyse News with AI"
-                if st.button(button_label, key=f"analyse_news_{event_index}", type="primary", disabled=already_analyzed, use_container_width=True):
-                    selected_event = event
+                if has_actual:
+                    button_label = "✅ Actual Analysed" if post_release_analyzed else "📊 Analyse Actual"
+                    if st.button(button_label, key=f"analyse_actual_{event_index}", type="primary", disabled=post_release_analyzed, use_container_width=True):
+                        selected_event = {**event, 'analysis_phase': 'POST_RELEASE'}
+                else:
+                    button_label = "✅ Pre-news Analysed" if already_analyzed else "🚀 Analyse Pre-news"
+                    if st.button(button_label, key=f"analyse_news_{event_index}", type="primary", disabled=already_analyzed, use_container_width=True):
+                        selected_event = {**event, 'analysis_phase': 'PRE_RELEASE'}
             st.markdown("---")
 
         if selected_event:
